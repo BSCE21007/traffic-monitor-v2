@@ -6,9 +6,12 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import threading
+import traceback
 import time
+import subprocess
 from pathlib import Path
-from scapy.all import sniff, IP, TCP
+from scapy.all import sniff, IP, TCP, get_if_list
+import ctypes
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QPushButton, QTextEdit, 
@@ -20,6 +23,45 @@ from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QMutex
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QIcon
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QPieSeries
 from PyQt6.QtCore import QPointF
+class QMutexLocker:
+    def __init__(self, mutex):
+        self.mutex = mutex
+        
+    def __enter__(self):
+        self.mutex.lock()
+        return self
+        
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.mutex.unlock()
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+def configure_windows_firewall():
+    try:
+        python_exe = sys.executable
+        subprocess.run(
+            f'netsh advfirewall firewall add rule name="Python IDS" dir=in action=allow program="{python_exe}" enable=yes',
+            shell=True,
+            check=True
+        )
+    except Exception as e:
+        print(f"Firewall config failed: {e}")   
+def enable_npcap_loopback():
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\NPF\Parameters",
+            0, 
+            winreg.KEY_SET_VALUE
+        )
+        winreg.SetValueEx(key, "LoopbackSupport", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"Registry tweak failed: {e}")
 def extract_features_from_packet(packet):
         features = {
             'IN_BYTES': len(packet) if hasattr(packet, 'src') else 0,
@@ -165,78 +207,199 @@ class ModelTrainingThread(QThread):
             self.status_update.emit(f"Error: {str(e)}")
 
 class MonitoringThread(QThread):
+    error = pyqtSignal(str)
     threat_detected = pyqtSignal(dict)
     status_update = pyqtSignal(str)
-    
-    def __init__(self):
+    packet_count = pyqtSignal(int)
+    feature_update = pyqtSignal(dict)
+    monitoring_stopped = pyqtSignal()
+
+    def __init__(self, interface = None):
         super().__init__()
+        self.interface = interface
+        self._stop = False
         self.model = None
         self.scaler = None
-        self.is_monitoring = False
-        self.mutex = QMutex()
-        
+        self.packet_counter = 0
+        self.last_packet_time = time.time()
+
+    def set_interface(self, interface):
+        self.interface = interface
+
     def load_model(self):
         try:
             self.model = joblib.load('trained_model/random_forest_model.joblib')
             self.scaler = joblib.load('trained_model/scaler.joblib')
+            self.status_update.emit("✅ Model loaded successfully")
             return True
         except Exception as e:
-            self.status_update.emit(f"Failed to load model: {str(e)}")
+            self.status_update.emit(f"❌ Failed to load model: {str(e)}")
             return False
-    
+
+    def update_feature_display(self, features):
+        text = "Extracted Features:\n"
+        for name, value in features.items():
+            text += f"{name}: {value}\n"
+        self.features_display.setText(text)
+        
     def start_monitoring(self):
-        self.mutex.lock()
-        self.is_monitoring = True
-        self.mutex.unlock()
+        with QMutexLocker(self.mutex):
+            self._is_running = True
+        self.start_time = time.time()
         if not self.isRunning():
             self.start()
-    
+
     def stop_monitoring(self):
-        self.mutex.lock()
-        self.is_monitoring = False
-        self.mutex.unlock()
-    
+        # signal the thread to exit its loop
+        self.monitoring_thread._stop = True
+        # update UI immediately
+        self.start_monitoring_btn.setEnabled(True)
+        self.stop_monitoring_btn.setEnabled(False)
+        self.traffic_display.append(...)
+
     def run(self):
-        if not self.model or not self.scaler:
+        try:
             if not self.load_model():
                 return
-        
-        self.status_update.emit("Monitoring started...")
-        
-        def packet_callback(packet):
+            from scapy.all import conf
+            conf.use_pcap = True
+            conf.use_npcap = True
+
+            # 3) notify GUI
+            self.status_update.emit(f"Starting capture on {self.interface or 'any'}")
+            while not self._stop:
+                sniff(
+                    iface=self.interface or None,
+                    prn=self._packet_handler,
+                    store=False,
+                    timeout=1, 
+                    # optional low‑level stop filter: returns True to stop sniff loop early
+                    stop_filter=lambda pkt: self._stop
+                )
+            # done
+        except Exception as e:
+            # catch everything and emit it
+            self.error.emit(f"Sniff failed: {e!r}")
+        finally:
+            self.status_update.emit("sMonitoring stopped")
+            self.monitoring_stopped.emit()
+            # Windows-specific setup for loopback
+            
+
+    def _packet_handler(self, packet):
+        try:
+            # Only process IPv4 packets
+            if not packet.haslayer(IP):
+                return
+
+            # 1) Extract raw feature list
             features = extract_features_from_packet(packet)
-            # Optionally scale features if you have a scaler
-            if self.scaler:
+
+            # 2) Emit for UI visualization (as a dict)
+            feature_dict = dict(zip([
+                'IN_BYTES', 'IN_PKTS', 'OUT_BYTES', 'OUT_PKTS',
+                'FLOW_DURATION_MILLISECONDS', 'DURATION_IN', 'DURATION_OUT',
+                'MIN_TTL', 'MAX_TTL', 'LONGEST_FLOW_PKT', 'SHORTEST_FLOW_PKT',
+                'MIN_IP_PKT_LEN', 'MAX_IP_PKT_LEN', 'SRC_TO_DST_SECOND_BYTES',
+                'DST_TO_SRC_SECOND_BYTES', 'RETRANSMITTED_IN_BYTES',
+                'RETRANSMITTED_IN_PKTS', 'RETRANSMITTED_OUT_BYTES',
+                'RETRANSMITTED_OUT_PKTS', 'SRC_TO_DST_AVG_THROUGHPUT',
+                'DST_TO_SRC_AVG_THROUGHPUT', 'NUM_PKTS_UP_TO_128_BYTES',
+                'NUM_PKTS_128_TO_256_BYTES', 'NUM_PKTS_256_TO_512_BYTES',
+                'NUM_PKTS_512_TO_1024_BYTES', 'NUM_PKTS_1024_TO_1514_BYTES',
+                'TCP_WIN_MAX_IN', 'TCP_WIN_MAX_OUT'
+            ], features))
+            self.feature_update.emit(feature_dict)
+
+            # 3) Scale features if a scaler was loaded
+            if self.scaler is not None:
                 features = self.scaler.transform([features])[0]
-            # Predict with your model
-            prediction = self.model.predict([features])
-            # ... handle/display prediction ...
-        
-        sniff(prn=packet_callback, store=0, filter="ip")
-        
-        self.status_update.emit("Monitoring stopped.")
-    
+
+            # 4) Run the model prediction
+            prediction = self.model.predict([features])[0]
+
+            # 5) Compute confidence if available
+            if hasattr(self.model, "predict_proba"):
+                probs = self.model.predict_proba([features])[0]
+                confidence = max(probs) * 100
+            else:
+                confidence = 95.0  # fallback
+
+            # 6) If it's not 'normal', emit a threat signal
+            if prediction != 0:
+                self.threat_detected.emit({
+                    'timestamp': datetime.now().strftime('%H:%M:%S'),
+                    'threat_type': str(prediction),
+                    'source_ip': packet[IP].src,
+                    'confidence': confidence,
+                    'details': f"{packet.summary()} | Size: {len(packet)} bytes"
+                })
+
+            # 7) Update packet count & emit
+            self.packet_count.emit(1)
+            self.packet_counter += 1
+
+            # 8) Update processing rate once per second
+            now = time.time()
+            elapsed = now - self.last_packet_time
+            if elapsed >= 1.0:
+                rate = self.packet_counter / elapsed
+                self.status_update.emit(f"📦 Processing: {rate:.1f} pkt/s")
+                self.packet_counter = 0
+                self.last_packet_time = now
+
+        except Exception as e:
+            # Catch any error in packet handling so the thread won't crash
+            print(f"Packet handler error: {e}")
+
+    def _should_stop(self, _):
+        with QMutexLocker(self.mutex):
+            return not self._is_running
     
 class MLHIDSMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+         # ─── Instantiate and connect MonitoringThread ────────────────────────────
+        self.monitoring_thread = MonitoringThread()
+        self.monitoring_thread.error.connect(self.on_monitoring_error)
+        self.monitoring_thread.status_update.connect(self.update_monitoring_status)
+        self.monitoring_thread.threat_detected.connect(self.handle_threat_detection)
+        self.monitoring_thread.packet_count.connect(self._update_packet_count)
+        self.monitoring_thread.feature_update.connect(self.update_feature_display)
+        self.monitoring_thread.monitoring_stopped.connect(self._monitoring_finished)
+        # ─────────────────────────────────────────────────────────────────────────
         self.setWindowTitle("ML-HIDS: AI-Driven Network Traffic Monitor")
         self.setGeometry(100, 100, 1400, 900)
         
         # Initialize threads
         self.training_thread = None
-        self.monitoring_thread = MonitoringThread()
         
         # Initialize UI
         self.init_ui()
         
-        # Connect signals
-        self.monitoring_thread.threat_detected.connect(self.handle_threat_detection)
-        self.monitoring_thread.status_update.connect(self.update_monitoring_status)
+       
         
         # Load model on startup if available
         self.check_model_availability()
-        
+    def on_monitoring_error(self, msg):
+        QMessageBox.critical(self, "Monitoring Error", msg)
+        # ensure the thread is stopped and UI buttons reset
+        self.monitoring_thread.stop_monitoring()
+        self.start_monitoring_btn.setEnabled(True)
+        self.stop_monitoring_btn.setEnabled(False)   
+
+    def update_feature_display(self, feature_dict):
+        """
+        Slot to receive the latest packet’s feature dict from MonitoringThread
+        and display it in the 'Feature Analysis' QTextEdit.
+        """
+        # Build a multi‑line string of “feature: value”
+        lines = ["Extracted Features:"]
+        for name, value in feature_dict.items():
+            lines.append(f"{name}: {value}")
+        # Join and set into your QTextEdit
+        self.features_display.setPlainText("\n".join(lines))
+    
     def init_ui(self):
         # Set application style
         self.setStyleSheet("""
@@ -356,8 +519,7 @@ class MLHIDSMainWindow(QMainWindow):
         actions_group = QGroupBox("Quick Actions")
         actions_layout = QHBoxLayout()
         
-        self.quick_train_btn = QPushButton("Train Model")
-        self.quick_train_btn.clicked.connect(self.show_training_tab)
+
         
         self.quick_monitor_btn = QPushButton("Start Monitoring")
         self.quick_monitor_btn.clicked.connect(self.start_monitoring)
@@ -366,7 +528,6 @@ class MLHIDSMainWindow(QMainWindow):
         self.quick_stop_btn.clicked.connect(self.stop_monitoring)
         self.quick_stop_btn.setEnabled(False)
         
-        actions_layout.addWidget(self.quick_train_btn)
         actions_layout.addWidget(self.quick_monitor_btn)
         actions_layout.addWidget(self.quick_stop_btn)
         actions_group.setLayout(actions_layout)
@@ -579,40 +740,71 @@ Classification Report:
             f"[{datetime.now().strftime('%H:%M:%S')}] Model training completed with accuracy: {results['accuracy']:.4f}"
         )
         
-    def start_monitoring(self):
-        if not os.path.exists('trained_model/random_forest_model.joblib'):
-            QMessageBox.warning(self, "Warning", "No trained model found. Please train a model first.")
-            return
-            
-        self.monitoring_thread.start_monitoring()
-        self.start_monitoring_btn.setEnabled(False)
-        self.stop_monitoring_btn.setEnabled(True)
-        self.quick_monitor_btn.setEnabled(False)
-        self.quick_stop_btn.setEnabled(True)
+        def start_monitoring(self):
+        # prevent double-start
+            if self.monitoring_thread.isRunning():
+                return
+
+            # 1) configure interface
+            iface = self.interface_combo.currentData()  # or .currentText()
+            self.monitoring_thread.set_interface(iface)
+
+            # 2) clear any previous stop flag
+            self.monitoring_thread._stop = False
+
+            # 3) start the thread
+            self.monitoring_thread.start()
+
+            # 4) update UI buttons/log
+            self.start_monitoring_btn.setEnabled(False)
+            self.stop_monitoring_btn.setEnabled(True)
+            self.traffic_display.append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring started on {iface}"
+            )
+
         
-        # Update status displays
-        self.monitoring_status_label.setText("🟢 Running")
-        self.monitoring_status_display.setText("Monitoring is active - analyzing network traffic...")
+    def _update_packet_count(self, count):
+        current = int(self.packets_count_label.text())
+        self.packets_count_label.setText(str(current + count))
         
-        # Log activity
-        self.activity_log.append(
-            f"[{datetime.now().strftime('%H:%M:%S')}] Network monitoring started"
-        )
-        
-    def stop_monitoring(self):
-        self.monitoring_thread.stop_monitoring()
+    def _monitoring_finished(self):
         self.start_monitoring_btn.setEnabled(True)
         self.stop_monitoring_btn.setEnabled(False)
-        self.quick_monitor_btn.setEnabled(True)
-        self.quick_stop_btn.setEnabled(False)
-        
-        # Update status displays
-        self.monitoring_status_label.setText("⏹️ Stopped")
-        self.monitoring_status_display.setText("Monitoring is stopped")
-        
-        # Log activity
-        self.activity_log.append(
-            f"[{datetime.now().strftime('%H:%M:%S')}] Network monitoring stopped"
+        self.traffic_display.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring stopped")
+    
+    def start_monitoring(self):
+        # Prevent double‑starts
+        if self.monitoring_thread.isRunning():
+            return
+
+        # 1) Pick up interface from the combo
+        iface = self.interface_combo.currentData() or self.interface_combo.currentText()
+        self.monitoring_thread.set_interface(iface)
+
+        # 2) Clear any prior stop flag
+        self.monitoring_thread._stop = False
+
+        # 3) Launch the thread
+        self.monitoring_thread.start()
+
+        # 4) Update your quick‑action buttons
+        self.quick_monitor_btn.setEnabled(False)
+        self.quick_stop_btn.setEnabled(True)
+
+        # 5) Optional log
+        self.activity_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring started on {iface}")
+
+    def stop_monitoring(self):
+        # signal the thread to exit its loop
+        self.monitoring_thread._stop = True
+        # optionally wait for it to finish cleanly
+        # self.monitoring_thread.wait(2000)
+
+        # update UI immediately
+        self.start_monitoring_btn.setEnabled(True)
+        self.stop_monitoring_btn.setEnabled(False)
+        self.traffic_display.append(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring stop requested"
         )
         
     def handle_threat_detection(self, threat_info):
@@ -631,6 +823,7 @@ Classification Report:
         self.threats_count_label.setText(str(current_count + 1))
         
         # Show alert if enabled
+        '''
         if self.alert_enabled.isChecked():
             alert = QMessageBox()
             alert.setIcon(QMessageBox.Icon.Warning)
@@ -638,7 +831,7 @@ Classification Report:
             alert.setText(f"Threat Type: {threat_info['threat_type']}\nSource IP: {threat_info['source_ip']}\nConfidence: {threat_info['confidence']:.2f}%")
             alert.setInformativeText(threat_info['details'])
             alert.exec()
-        
+        '''
         # Update activity log
         self.activity_log.append(
             f"[{threat_info['timestamp']}] Threat detected: {threat_info['threat_type']} from {threat_info['source_ip']} (Confidence: {threat_info['confidence']:.2f}%)"
@@ -715,7 +908,10 @@ Classification Report:
         interface_layout = QHBoxLayout()
         interface_layout.addWidget(QLabel("Network Interface:"))
         self.interface_combo = QComboBox()
-        self.interface_combo.addItems(["any", "eth0", "wlan0", "lo"])
+        self.interface_combo.clear()
+        self.interface_combo.addItem("any", "any")
+        for iface in get_if_list():
+            self.interface_combo.addItem(iface, iface)
         interface_layout.addWidget(self.interface_combo)
         interface_layout.addStretch()
         status_layout.addLayout(interface_layout)
@@ -886,15 +1082,18 @@ Classification Report:
         event.accept()
 
 def main():
+    if not is_admin():
+        # Re-run with admin rights without creating duplicate windows
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, " ".join([f'"{x}"' for x in sys.argv]), None, 1
+        )
+        sys.exit(0)  # Exit the non-elevated instance
+    configure_windows_firewall()
+    #enable_npcap_loopback()
     app = QApplication(sys.argv)
-    
-    # Set application style
     app.setStyle("Fusion")
-    
-    # Create and show main window
     main_window = MLHIDSMainWindow()
     main_window.show()
-    
     sys.exit(app.exec())
 
 if __name__ == "__main__":
