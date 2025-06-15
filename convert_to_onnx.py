@@ -210,7 +210,7 @@ class MonitoringThread(QThread):
     error = pyqtSignal(str)
     threat_detected = pyqtSignal(dict)
     status_update = pyqtSignal(str)
-    packet_count = pyqtSignal(int)
+    packet_count = pyqtSignal(int, int)
     feature_update = pyqtSignal(dict)
     monitoring_stopped = pyqtSignal()
 
@@ -230,12 +230,14 @@ class MonitoringThread(QThread):
         try:
             self.model = joblib.load('trained_model/random_forest_model.joblib')
             self.scaler = joblib.load('trained_model/scaler.joblib')
-            self.le = joblib.load('trained_model/label_encoder.joblib')
             self.feature_columns = joblib.load('trained_model/feature_columns.pkl')
-            self.status_update.emit("✅ Model, scaler, encoder, and feature columns loaded successfully")
+            self.status_update.emit("✅ Model, scaler, and feature columns loaded successfully")
             return True
         except Exception as e:
-            self.status_update.emit(f"❌ Failed to load model: {e}")
+            self.status_update.emit(f"❌ Failed to load model or features: {e}")
+            self.model = None
+            self.scaler = None
+            self.feature_columns = None
             return False
 
     def update_feature_display(self, features):
@@ -266,31 +268,24 @@ class MonitoringThread(QThread):
 
     def run(self):
         try:
+            self.status_update.emit("Starting model load...")
             if not self.load_model():
-                # Emit error via status_update; then exit so thread finishes cleanly
+                self.status_update.emit("Model failed to load. Exiting.")
                 return
-            from scapy.all import conf, sniff, IP, TCP
-            conf.use_pcap = True
-            conf.use_npcap = True
+            self.status_update.emit("✅ Model loaded. Starting packet sniffing...")
 
             self.status_update.emit(f"Starting capture on {self.interface or 'any'}")
             while not self.isInterruptionRequested():
-                try:
-                    sniff(
-                        iface=self.interface or None,
-                        prn=self._packet_handler,
-                        store=False,
-                        timeout=1,
-                        stop_filter=lambda pkt: self.isInterruptionRequested()
-                    )
-                except Exception as e:
-                    self.error.emit(f"Sniff error: {e!r}")
-                    break
-            # Loop exits once requestInterruption() is called
+                sniff(
+                    iface=self.interface or None,
+                    prn=self._packet_handler,
+                    store=False,
+                    timeout=1,
+                    stop_filter=lambda pkt: self.isInterruptionRequested()
+                )
         except Exception as e:
             self.error.emit(f"Sniff failed: {e!r}")
         finally:
-            # Typo fixed: no stray 's'
             self.status_update.emit("Monitoring stopped")
             self.monitoring_stopped.emit()
 
@@ -323,7 +318,8 @@ class MonitoringThread(QThread):
 
             # 3) Scale features if a scaler was loaded
             if self.scaler is not None:
-                features = self.scaler.transform([features])[0]
+                X = pd.DataFrame([features], columns=self.feature_columns)
+                features = self.scaler.transform(X)[0]
 
             # 4) Run the model prediction
             prediction = self.model.predict([features])[0]
@@ -346,7 +342,7 @@ class MonitoringThread(QThread):
                 })
 
             # 7) Update packet count & emit
-            self.packet_count.emit(1)
+            self.packet_count.emit(1, len(packet))
             self.packet_counter += 1
 
             # 8) Update processing rate once per second
@@ -370,6 +366,7 @@ class MLHIDSMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
          # ─── Instantiate and connect MonitoringThread ────────────────────────────
+        self.total_data_processed = 0  # in bytes
         self.monitoring_thread = MonitoringThread()
         self.monitoring_thread.error.connect(self.on_monitoring_error)
         self.monitoring_thread.status_update.connect(self.update_monitoring_status)
@@ -391,34 +388,17 @@ class MLHIDSMainWindow(QMainWindow):
         
         # Load model on startup if available
         self.check_model_availability()
-    def _check_model_files(self):
-        """
-        Verify that trained_model/random_forest_model.joblib and scaler.joblib exist
-        and can be loaded. Return True if OK, False otherwise.
-        """
-        model_path = 'trained_model/random_forest_model.joblib'
-        scaler_path = 'trained_model/scaler.joblib'
-        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-            QMessageBox.warning(self, "Model Missing",
-                                "Trained model or scaler not found. Please train or load a valid model before monitoring.")
-            return False
-        # Optionally try loading to catch corruption early:
-        try:
-            _ = joblib.load(model_path)
-            _ = joblib.load(scaler_path)
-        except Exception as e:
-            QMessageBox.critical(self, "Model Load Error",
-                                 f"Failed to load model or scaler: {e}")
-            return False
-        return True
-    
+
     def _create_and_configure_monitoring_thread(self):
         """Instantiate MonitoringThread, connect signals, return it."""
         thread = MonitoringThread()
         thread.error.connect(self.on_monitoring_error)
         thread.status_update.connect(self.update_monitoring_status)
         thread.threat_detected.connect(self.handle_threat_detection)
-        thread.packet_count.connect(self._update_packet_count)
+
+        # This is where you put it:
+        thread.packet_count.connect(self._update_packet_count)  
+
         thread.feature_update.connect(self.update_feature_display)
         thread.monitoring_stopped.connect(self._monitoring_finished)
         return thread
@@ -805,10 +785,13 @@ Classification Report:
             )
 
         
-    def _update_packet_count(self, count):
-        current = int(self.packets_count_label.text())
-        self.packets_count_label.setText(str(current + count))
-        
+    def _update_packet_count(self, packet_count, byte_count):
+        self.packets_processed += packet_count
+        self.packets_count_label.setText(str(self.packets_processed))
+        self.total_data_processed += byte_count
+        mb = self.total_data_processed / (1024 * 1024)
+        self.total_data_label.setText(f"{mb:.2f} MB")
+            
     def _monitoring_finished(self):
         self.start_monitoring_btn.setEnabled(True)
         self.stop_monitoring_btn.setEnabled(False)
@@ -819,25 +802,20 @@ Classification Report:
         if hasattr(self, 'monitoring_thread') and self.monitoring_thread.isRunning():
             return
 
-        # Ensure model is present and loadable
-        if not self._check_model_files():
-            return
-
-        # Create fresh thread
+        # Create new thread each time
         self.monitoring_thread = self._create_and_configure_monitoring_thread()
         # Pick interface
         iface = self.interface_combo.currentData() or self.interface_combo.currentText()
         self.monitoring_thread.set_interface(iface)
         # Start the thread
         self.monitoring_thread.start()
-
         # Update UI buttons
         self.start_monitoring_btn.setEnabled(False)
         self.quick_monitor_btn.setEnabled(False)
         self.stop_monitoring_btn.setEnabled(True)
         self.quick_stop_btn.setEnabled(True)
+        # Log
         self.activity_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring started on {iface}")
-
 
     def stop_monitoring(self):
         # signal the thread to exit its loop
@@ -913,6 +891,7 @@ Classification Report:
         )
     def create_monitoring_tab(self):
         monitoring_widget = QWidget()
+        monitoring_layout = QVBoxLayout()
         layout = QVBoxLayout()
         
         # Title
@@ -996,18 +975,20 @@ Classification Report:
         threats_layout.addWidget(self.live_threats_count_label)
         threats_group.setLayout(threats_layout)
         
-        # Processing rate
-        rate_group = QGroupBox("Processing Rate")
-        rate_layout = QVBoxLayout()
-        self.processing_rate_label = QLabel("0 pkt/s")
-        self.processing_rate_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
-        self.processing_rate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rate_layout.addWidget(self.processing_rate_label)
-        rate_group.setLayout(rate_layout)
-        
+       
+        data_group = QGroupBox("Total Data Processed")
+        data_layout = QVBoxLayout()
+        self.total_data_label = QLabel("0.00 MB")
+        self.total_data_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        self.total_data_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.total_data_label.setStyleSheet("color: #009688;")
+        data_layout.addWidget(self.total_data_label)
+        data_group.setLayout(data_layout)
+        monitoring_layout.addWidget(data_group)
+
         stats_layout.addWidget(packets_group)
         stats_layout.addWidget(threats_group)
-        stats_layout.addWidget(rate_group)
+        stats_layout.addWidget(data_group)
         traffic_layout.addLayout(stats_layout)
         
         # Live traffic display
@@ -1087,10 +1068,7 @@ Classification Report:
         self.last_packet_time = time.time()
         
         # Setup timer for updating processing rate
-        self.rate_timer = QTimer()
-        self.rate_timer.timeout.connect(self.update_processing_rate)
-        self.rate_timer.start(1000)  # Update every second
-
+    
     def clear_traffic_log(self):
         """Clear the traffic display log"""
         self.traffic_display.clear()
@@ -1102,18 +1080,7 @@ Classification Report:
         )
 
 
-    def update_processing_rate(self):
-        """Update the processing rate display"""
-        current_time = time.time()
-        time_diff = current_time - self.last_packet_time
-        
-        if time_diff > 0:
-            # Calculate packets per second (this is a simplified calculation)
-            # In a real implementation, you'd track packets over a rolling window
-            rate = 1.0 / time_diff if time_diff < 1 else 0
-            self.processing_rate_label.setText(f"{rate:.1f} pkt/s")
-        
-        self.last_packet_time = current_time    
+      
     def show_training_tab(self):
         self.tab_widget.setCurrentIndex(1)  # Training tab is index 1 (second tab)
         
