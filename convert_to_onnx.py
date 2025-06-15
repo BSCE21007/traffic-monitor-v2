@@ -230,10 +230,12 @@ class MonitoringThread(QThread):
         try:
             self.model = joblib.load('trained_model/random_forest_model.joblib')
             self.scaler = joblib.load('trained_model/scaler.joblib')
-            self.status_update.emit("✅ Model loaded successfully")
+            self.le = joblib.load('trained_model/label_encoder.joblib')
+            self.feature_columns = joblib.load('trained_model/feature_columns.pkl')
+            self.status_update.emit("✅ Model, scaler, encoder, and feature columns loaded successfully")
             return True
         except Exception as e:
-            self.status_update.emit(f"❌ Failed to load model: {str(e)}")
+            self.status_update.emit(f"❌ Failed to load model: {e}")
             return False
 
     def update_feature_display(self, features):
@@ -251,39 +253,47 @@ class MonitoringThread(QThread):
 
     def stop_monitoring(self):
         # signal the thread to exit its loop
-        self.monitoring_thread._stop = True
-        # update UI immediately
+        if self.monitoring_thread and self.monitoring_thread.isRunning():
+            self.monitoring_thread.requestInterruption()
+            # Optionally: disable Stop button to prevent repeated clicks
+            self.stop_monitoring_btn.setEnabled(False)
+            # Wait for up to e.g. 2 seconds
+            self.monitoring_thread.wait(2000)
+        # Update UI
         self.start_monitoring_btn.setEnabled(True)
-        self.stop_monitoring_btn.setEnabled(False)
-        self.traffic_display.append(...)
+        self.quick_monitor_btn.setEnabled(True)
+        self.activity_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring stopped")
 
     def run(self):
         try:
             if not self.load_model():
+                # Emit error via status_update; then exit so thread finishes cleanly
                 return
-            from scapy.all import conf
+            from scapy.all import conf, sniff, IP, TCP
             conf.use_pcap = True
             conf.use_npcap = True
 
-            # 3) notify GUI
             self.status_update.emit(f"Starting capture on {self.interface or 'any'}")
-            while not self._stop:
-                sniff(
-                    iface=self.interface or None,
-                    prn=self._packet_handler,
-                    store=False,
-                    timeout=1, 
-                    # optional low‑level stop filter: returns True to stop sniff loop early
-                    stop_filter=lambda pkt: self._stop
-                )
-            # done
+            while not self.isInterruptionRequested():
+                try:
+                    sniff(
+                        iface=self.interface or None,
+                        prn=self._packet_handler,
+                        store=False,
+                        timeout=1,
+                        stop_filter=lambda pkt: self.isInterruptionRequested()
+                    )
+                except Exception as e:
+                    self.error.emit(f"Sniff error: {e!r}")
+                    break
+            # Loop exits once requestInterruption() is called
         except Exception as e:
-            # catch everything and emit it
             self.error.emit(f"Sniff failed: {e!r}")
         finally:
-            self.status_update.emit("sMonitoring stopped")
+            # Typo fixed: no stray 's'
+            self.status_update.emit("Monitoring stopped")
             self.monitoring_stopped.emit()
-            # Windows-specific setup for loopback
+
             
 
     def _packet_handler(self, packet):
@@ -381,6 +391,38 @@ class MLHIDSMainWindow(QMainWindow):
         
         # Load model on startup if available
         self.check_model_availability()
+    def _check_model_files(self):
+        """
+        Verify that trained_model/random_forest_model.joblib and scaler.joblib exist
+        and can be loaded. Return True if OK, False otherwise.
+        """
+        model_path = 'trained_model/random_forest_model.joblib'
+        scaler_path = 'trained_model/scaler.joblib'
+        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            QMessageBox.warning(self, "Model Missing",
+                                "Trained model or scaler not found. Please train or load a valid model before monitoring.")
+            return False
+        # Optionally try loading to catch corruption early:
+        try:
+            _ = joblib.load(model_path)
+            _ = joblib.load(scaler_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Model Load Error",
+                                 f"Failed to load model or scaler: {e}")
+            return False
+        return True
+    
+    def _create_and_configure_monitoring_thread(self):
+        """Instantiate MonitoringThread, connect signals, return it."""
+        thread = MonitoringThread()
+        thread.error.connect(self.on_monitoring_error)
+        thread.status_update.connect(self.update_monitoring_status)
+        thread.threat_detected.connect(self.handle_threat_detection)
+        thread.packet_count.connect(self._update_packet_count)
+        thread.feature_update.connect(self.update_feature_display)
+        thread.monitoring_stopped.connect(self._monitoring_finished)
+        return thread
+
     def on_monitoring_error(self, msg):
         QMessageBox.critical(self, "Monitoring Error", msg)
         # ensure the thread is stopped and UI buttons reset
@@ -773,26 +815,29 @@ Classification Report:
         self.traffic_display.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring stopped")
     
     def start_monitoring(self):
-        # Prevent double‑starts
-        if self.monitoring_thread.isRunning():
+    # Prevent double‑starts
+        if hasattr(self, 'monitoring_thread') and self.monitoring_thread.isRunning():
             return
 
-        # 1) Pick up interface from the combo
+        # Ensure model is present and loadable
+        if not self._check_model_files():
+            return
+
+        # Create fresh thread
+        self.monitoring_thread = self._create_and_configure_monitoring_thread()
+        # Pick interface
         iface = self.interface_combo.currentData() or self.interface_combo.currentText()
         self.monitoring_thread.set_interface(iface)
-
-        # 2) Clear any prior stop flag
-        self.monitoring_thread._stop = False
-
-        # 3) Launch the thread
+        # Start the thread
         self.monitoring_thread.start()
 
-        # 4) Update your quick‑action buttons
+        # Update UI buttons
+        self.start_monitoring_btn.setEnabled(False)
         self.quick_monitor_btn.setEnabled(False)
+        self.stop_monitoring_btn.setEnabled(True)
         self.quick_stop_btn.setEnabled(True)
-
-        # 5) Optional log
         self.activity_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring started on {iface}")
+
 
     def stop_monitoring(self):
         # signal the thread to exit its loop
