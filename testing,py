@@ -1,0 +1,75 @@
+import os
+import random
+import textwrap
+
+# Directory where files will be created
+root = r"F:\fyp code\ids_test_root"  # change as desired
+os.makedirs(root, exist_ok=True)
+
+# 1. Generate small HTML pages
+num_pages = 5
+lorem = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+    "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+)
+
+# Create index.html linking to pages
+filenames = [f"page{i}.html" for i in range(1, num_pages+1)]
+# index.html
+with open(os.path.join(root, "index.html"), "w", encoding="utf-8") as f:
+    f.write("""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Home</title></head>
+<body>
+  <h1>Home</h1>
+  <p>{}</p>
+  <ul>
+""".format(lorem))
+    for name in filenames:
+        f.write(f'    <li><a href="{name}">{name}</a></li>\n')
+    f.write("""  </ul>
+</body>
+</html>""")
+
+# Create each pageX.html linking back to index and maybe others
+for i, name in enumerate(filenames, start=1):
+    with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+        f.write(f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>{name}</title></head>
+<body>
+  <h1>{name}</h1>
+  <p>{lorem}</p>
+  <p>{lorem}</p>
+  <ul>
+    <li><a href="index.html">Home</a></li>
+""")
+        # link to one other random page
+        others = [n for n in filenames if n != name]
+        if others:
+            target = random.choice(others)
+            f.write(f'    <li><a href="{target}">Go to {target}</a></li>\n')
+        f.write("""  </ul>
+</body>
+</html>""")
+
+print(f"Created {num_pages+1} HTML files in {root}")
+
+# 2. Generate dummy .bin files
+# Sizes in bytes
+sizes = [50 * 1024 * 1024, 100 * 1024 * 1024]  # 50 MB, 100 MB
+for size in sizes:
+    fname = f"large_{size//(1024*1024)}MB.bin"
+    path = os.path.join(root, fname)
+    if not os.path.exists(path):
+        # Create zero-filled file
+        with open(path, "wb") as f:
+            chunk = b'\0' * (1024*1024)  # 1 MB chunk
+            written = 0
+            while written < size:
+                to_write = min(len(chunk), size - written)
+                f.write(chunk[:to_write])
+                written += to_write
+        print(f"Created {fname} ({size} bytes)")
+    else:
+        print(f"{fname} already exists")
